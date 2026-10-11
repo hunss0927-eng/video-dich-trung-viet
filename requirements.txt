@@ -1,5 +1,6 @@
-streamlit
-google-genai
-edge-tts
+streamlit>=1.40
+google-genai>=1.51.0
+edge-tts>=7.0.0
 numpy
 pandas
+gTTS
