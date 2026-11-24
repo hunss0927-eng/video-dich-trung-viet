@@ -742,16 +742,17 @@ def build_dub_track(segments, seg_paths, total, max_speed, out_wav):
     return {"sped_up": sped_up, "max_delay": max_delay}
 
 
-def merge_audio_video(video_path, dub_wav, out_path, bg_volume=0.0, keep_original=True):
+def merge_audio_video(video_path, dub_wav, out_path, bg_volume=0.0, keep_original=True, voice_volume=1.0):
     """Ghép giọng lồng tiếng vào video. bg_volume > 0 giữ lại tiếng gốc ở mức nhỏ."""
     cmd = ["ffmpeg", "-y", "-i", video_path, "-i", dub_wav]
     if keep_original and has_audio_stream(video_path):
         fmt = "aformat=sample_rates=44100:channel_layouts=stereo"
-        graph = (f"[0:a]volume={bg_volume:.2f},{fmt}[bg];[1:a]{fmt}[vo];"
+        graph = (f"[0:a]volume={bg_volume:.2f},{fmt}[bg];[1:a]volume={voice_volume:.2f},{fmt}[vo];"
                  "[vo][bg]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]")
         cmd += ["-filter_complex", graph, "-map", "0:v:0", "-map", "[a]"]
     else:
         cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+        cmd += ["-af", f"volume={voice_volume:.2f}"]
     if get_video_codec(video_path) == "h264":  # copy nếu đã là H.264, nếu không mã hóa lại cho chạy được trên web
         cmd += ["-c:v", "copy"]
     else:
@@ -792,9 +793,18 @@ def reset_workspace(video_key):
 
 
 def main():
-    st.set_page_config(page_title="Dịch & Lồng Tiếng Video bằng Gemini AI", page_icon="🎬", layout="centered")
+    st.set_page_config(page_title="Dịch & Lồng Tiếng Video bằng Gemini AI", page_icon="🎬", layout="wide")
     st.title("🎬 Dịch & Lồng Tiếng Video đa ngôn ngữ")
-    st.subheader("Gemini AI + giọng đọc AI nhiều ngôn ngữ")
+    st.caption("Tải video · Dịch lời thoại · Chỉnh bản dịch · Tạo giọng và xuất video")
+    st.markdown("""
+        <style>
+        .block-container {max-width: 1450px; padding-top: 1.5rem; padding-bottom: 3rem;}
+        [data-testid="stSidebar"] {min-width: 330px;}
+        div[data-testid="stMetric"] {background: rgba(120,120,120,.08); padding: 12px; border-radius: 12px;}
+        </style>
+    """, unsafe_allow_html=True)
+    with st.expander("🧭 Hướng dẫn nhanh", expanded=False):
+        st.markdown("1. Chọn nhà cung cấp và ngôn ngữ ở thanh bên. **DeepSeek cần cả Gemini API key để nhận diện lời thoại.**\n2. Tải video, bấm **Nghe & dịch**.\n3. Sửa lời dịch trực tiếp hoặc nhập CSV đã chỉnh.\n4. Chọn giữ/xóa tiếng gốc, chỉnh âm lượng rồi tạo video.")
 
     if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
         st.error("Chưa cài FFmpeg (cần cả ffmpeg và ffprobe trong PATH). "
@@ -877,6 +887,7 @@ def main():
         bg_pct = st.slider("Âm lượng tiếng gốc (%)", 0, 100, 15, step=5,
                            disabled=not keep_original,
                            help="Tắt lựa chọn trên để xóa toàn bộ tiếng gốc khỏi video.")
+        voice_pct = st.slider("Âm lượng giọng lồng tiếng (%)", 25, 200, 100, step=5)
 
         if st.button("🔊 Nghe thử giọng này"):
             try:
@@ -904,6 +915,9 @@ def main():
         st.stop()
     if not uploaded:
         st.stop()
+    if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
+        st.error(f"File vượt giới hạn cấu hình {MAX_UPLOAD_MB:,} MB.")
+        st.stop()
 
     # ---- Lưu video vào thư mục tạm riêng của phiên làm việc ----
     video_key = (uploaded.name, uploaded.size)
@@ -922,7 +936,10 @@ def main():
 
     workdir, video_path, total = st.session_state.workdir, st.session_state.video_path, st.session_state.total
     st.video(video_path)
-    st.caption(f"Thời lượng: {total:.1f} giây")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Thời lượng", f"{total / 60:.1f} phút")
+    m2.metric("Dung lượng", f"{uploaded.size / (1024 * 1024):.1f} MB")
+    m3.metric("Tiếng gốc", "Giữ làm nền" if keep_original else "Sẽ xóa")
 
     # ---- Bước 1: nghe & dịch ----
     if st.button("1️⃣ Nghe & dịch bằng Gemini", type="primary"):
@@ -949,9 +966,27 @@ def main():
 
     # ---- Xem / sửa bản dịch ----
     if st.session_state.get("segments"):
+        st.markdown("### 📝 Bước 2 · Kiểm tra và chỉnh lời dịch")
         used = ", ".join(st.session_state.get("used_models", []))
         st.success(f"Đã dịch {len(st.session_state.segments)} đoạn thoại bằng {used}. "
                    "Kiểm tra và sửa bản dịch bên dưới (bấm vào ô để sửa, thêm/xóa dòng nếu cần).")
+        csv_upload = st.file_uploader("Nhập bản dịch đã chỉnh (CSV: start,end,speaker,text)",
+                                      type=["csv"], key="translation_csv_upload")
+        if csv_upload:
+            csv_key = (csv_upload.name, csv_upload.size)
+            if st.session_state.get("imported_csv_key") != csv_key:
+                try:
+                    csv_rows = pd.read_csv(csv_upload).to_dict("records")
+                    imported = normalize_segments(csv_rows, total)
+                    if not imported:
+                        st.error("CSV không có dòng hợp lệ. Cần các cột start, end và text.")
+                    else:
+                        st.session_state.segments = imported
+                        st.session_state.imported_csv_key = csv_key
+                        st.session_state.pop("segment_editor", None)
+                        st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Không đọc được CSV: {e}")
         edited = st.data_editor(
             pd.DataFrame(st.session_state.segments),
             num_rows="dynamic",
@@ -965,9 +1000,13 @@ def main():
             },
             key="segment_editor",
         )
+        st.download_button("📥 Tải lời dịch hiện tại (.csv)",
+                           edited.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="ban_dich.csv", mime="text/csv")
 
         # ---- Bước 2: tạo giọng + ghép video ----
-        if st.button("2️⃣ Tạo giọng lồng tiếng & ghép vào video", type="primary"):
+        st.markdown("### 🎙️ Bước 3 · Tạo giọng và xuất video")
+        if st.button("3️⃣ Tạo giọng lồng tiếng & ghép vào video", type="primary"):
             st.session_state.pop("result", None)
             segments = normalize_segments(edited.to_dict("records"), total)
             if not segments:
@@ -993,9 +1032,10 @@ def main():
 
                     bar.progress(0.8, text="Đang ghép âm thanh lồng tiếng vào video...")
                     out_path = os.path.join(workdir, "output_video.mp4")
-                    merge_audio_video(video_path, dub_wav, out_path, bg_pct / 100, keep_original)
+                    merge_audio_video(video_path, dub_wav, out_path, bg_pct / 100, keep_original, voice_pct / 100)
 
-                    st.session_state.result = {"path": out_path, "srt": make_srt(segments), "stats": stats}
+                    st.session_state.result = {"path": out_path, "srt": make_srt(segments),
+                                               "segments": segments, "stats": stats}
                     bar.empty()
                 except Exception as e:  # noqa: BLE001
                     bar.empty()
@@ -1015,7 +1055,7 @@ def main():
         if stats["max_delay"] > 1.5:
             st.info(f"Một số đoạn dịch đọc dài hơn lời thoại gốc nên bị trễ tối đa {stats['max_delay']:.1f}s. "
                     "Hãy rút gọn các câu dài trong bảng dịch rồi bấm bước 2 lại.")
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             with open(result["path"], "rb") as f:
                 st.download_button("📥 Tải video đã lồng tiếng", f,
@@ -1023,6 +1063,10 @@ def main():
         with col2:
             st.download_button("📄 Tải phụ đề (.srt)", result["srt"].encode("utf-8"),
                                file_name="phu_de.srt", mime="text/plain")
+        with col3:
+            csv_bytes = pd.DataFrame(result.get("segments", [])).to_csv(index=False).encode("utf-8-sig")
+            st.download_button("📊 Tải bản dịch (.csv)", csv_bytes,
+                               file_name="ban_dich.csv", mime="text/csv")
 
 
 if __name__ == "__main__":
