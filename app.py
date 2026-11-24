@@ -850,6 +850,26 @@ def make_srt(segments):
     return "\n".join(lines)
 
 
+def parse_srt(content, total):
+    """Load existing subtitle cues and preserve their timestamps for direct dubbing."""
+    cues = []
+    pattern = re.compile(r"(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})")
+    for block in re.split(r"\r?\n\s*\r?\n", content.strip()):
+        lines = block.splitlines()
+        match = next((pattern.search(line) for line in lines if pattern.search(line)), None)
+        if not match:
+            continue
+        text_start = lines.index(match.string) + 1 if match.string in lines else 0
+        text = " ".join(lines[text_start:]).strip()
+        text = re.sub(r"<[^>]+>", "", text).replace(r"\N", " ").strip()
+        if text:
+            cues.append({"start": match.group(1), "end": match.group(2), "speaker": None, "text": text})
+    normalized = normalize_segments(cues, total)
+    if not normalized:
+        raise ValueError("Không tìm thấy câu phụ đề SRT hợp lệ trong file.")
+    return normalized
+
+
 # ----------------------------------------------------------------------------
 # Giao diện Streamlit
 # ----------------------------------------------------------------------------
@@ -887,7 +907,7 @@ def main():
     # ---- Thanh bên ----
     with st.sidebar:
         st.header("⚙️ Cài đặt")
-        provider = st.selectbox("Nhà cung cấp dịch", ["DeepSeek", "Gemini", "ChatGPT (chưa kết nối API)"])
+        provider = st.selectbox("Chế độ", ["Lồng tiếng từ SRT (không dịch)", "DeepSeek", "Gemini", "ChatGPT (chưa kết nối API)"])
         api_key, choice, items = "", AUTO_MODEL, []
         if provider == "Gemini":
             api_key = st.text_input("Google Gemini API Key:", type="password").strip()
@@ -971,6 +991,9 @@ def main():
                                 help="Mỗi dòng một cặp 'gốc = bản dịch' để tên riêng được dịch nhất quán.")
 
     uploaded = st.file_uploader(f"Tải lên video (tối đa cấu hình {MAX_UPLOAD_MB:,} MB; giới hạn máy chủ có thể thấp hơn)", type=["mp4", "mov", "avi", "mkv"])
+    srt_uploaded = None
+    if provider == "Lồng tiếng từ SRT (không dịch)":
+        srt_uploaded = st.file_uploader("Tải lên phụ đề .srt để lồng tiếng trực tiếp", type=["srt"], key="direct_srt_upload")
     st.caption("Quy trình hỗ trợ video dài bằng cách chia audio thành các đoạn dịch; giới hạn thực tế còn tùy RAM, ổ đĩa, thời gian chạy và hạn mức API.")
     if provider.startswith("ChatGPT"):
         st.stop()
@@ -1008,8 +1031,24 @@ def main():
     m2.metric("Dung lượng", f"{uploaded.size / (1024 * 1024):.1f} MB")
     m3.metric("Tiếng gốc", "Giữ làm nền" if keep_original else "Sẽ xóa")
 
+    if provider == "Lồng tiếng từ SRT (không dịch)":
+        if not srt_uploaded:
+            st.info("Tải file .srt có sẵn để dùng phụ đề làm lời lồng tiếng. Chế độ này không gọi API dịch.")
+        else:
+            srt_key = (srt_uploaded.name, srt_uploaded.size, video_key)
+            if st.session_state.get("direct_srt_key") != srt_key:
+                try:
+                    subtitle_text = srt_uploaded.getvalue().decode("utf-8-sig", errors="replace")
+                    st.session_state.segments = parse_srt(subtitle_text, total)
+                    st.session_state.used_models = ["Phụ đề SRT (không dịch)"]
+                    st.session_state.pop("result", None)
+                    st.session_state.pop("segment_editor", None)
+                    st.session_state.direct_srt_key = srt_key
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Không đọc được phụ đề: {e}")
+
     # ---- Bước 1: nghe & dịch ----
-    if st.button("1️⃣ Nghe & dịch bằng Gemini", type="primary"):
+    if provider != "Lồng tiếng từ SRT (không dịch)" and st.button("1️⃣ Nghe & dịch", type="primary"):
         for k in ("result", "segments", "segment_editor"):
             st.session_state.pop(k, None)
         bar = st.progress(0.0, text="Đang bắt đầu...")
