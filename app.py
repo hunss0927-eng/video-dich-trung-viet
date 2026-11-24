@@ -21,6 +21,7 @@ import tempfile
 import time
 import traceback
 import wave
+import requests
 
 import edge_tts
 import numpy as np
@@ -546,6 +547,54 @@ def translate_with_deepseek(client, model, segments, dst_code):
     return [{**seg, "text": by_index[i]} for i, seg in enumerate(segments)]
 
 
+def translate_audio_deepseek(audio_path, total, api_key, client, model, dst_code, workdir, progress):
+    """Use DeepSeek ASR directly, then translate transcript; ASR has no word timestamps."""
+    sentences = []
+    chunk_seconds = 115  # DeepSeek ASR limit is 120 seconds per request.
+    chunk_count = max(1, math.ceil(total / chunk_seconds))
+    for i in range(chunk_count):
+        start = i * chunk_seconds
+        duration = min(chunk_seconds, total - start)
+        progress(0.08 + 0.65 * i / chunk_count, f"DeepSeek đang nghe đoạn {i + 1}/{chunk_count}...")
+        wav_path = os.path.join(workdir, f"deepseek_asr_{i:04d}.wav")
+        try:
+            run_cmd(["ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+                     "-i", audio_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path])
+            if os.path.getsize(wav_path) > 8 * 1024 * 1024:
+                raise ValueError("Đoạn audio DeepSeek vượt 8 MB; hãy giảm thời lượng từng đoạn.")
+            with open(wav_path, "rb") as f:
+                response = requests.post(
+                    "https://api.deepseek.com/v1/tools/asr",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files={"file": (os.path.basename(wav_path), f, "audio/wav")},
+                    timeout=600,
+                )
+            response.raise_for_status()
+            transcript = response.json().get("text", "").strip()
+        finally:
+            if os.path.exists(wav_path):
+                os.remove(wav_path)
+        if not transcript:
+            continue
+        parts = [x.strip() for x in re.split(r"(?<=[.!?。！？])\s*", transcript) if x.strip()]
+        if not parts:
+            parts = [transcript]
+        weights = [max(1, len(re.findall(r"\w+", part))) for part in parts]
+        weight_sum = sum(weights)
+        offset = 0.0
+        for part, weight in zip(parts, weights):
+            span = duration * weight / weight_sum
+            sentences.append({"start": round(start + offset, 2), "end": round(start + offset + span, 2),
+                              "speaker": None, "text": part})
+            offset += span
+    if not sentences:
+        raise ValueError("DeepSeek không nhận diện được lời thoại trong video.")
+    progress(0.78, "DeepSeek đang dịch lời thoại...")
+    translated = translate_with_deepseek(client, model, sentences, dst_code)
+    progress(1.0, "Đã chép lời và dịch xong bằng DeepSeek")
+    return translated, [f"DeepSeek ASR + {model}"]
+
+
 def _file_state(f):
     return getattr(getattr(f, "state", None), "name", None)
 
@@ -793,7 +842,7 @@ def reset_workspace(video_key):
 
 
 def main():
-    st.set_page_config(page_title="Dịch & Lồng Tiếng Video bằng Gemini AI", page_icon="🎬", layout="wide")
+    st.set_page_config(page_title="Dịch & Lồng Tiếng Video AI", page_icon="🎬", layout="wide")
     st.title("🎬 Dịch & Lồng Tiếng Video đa ngôn ngữ")
     st.caption("Tải video · Dịch lời thoại · Chỉnh bản dịch · Tạo giọng và xuất video")
     st.markdown("""
@@ -804,7 +853,7 @@ def main():
         </style>
     """, unsafe_allow_html=True)
     with st.expander("🧭 Hướng dẫn nhanh", expanded=False):
-        st.markdown("1. Chọn nhà cung cấp và ngôn ngữ ở thanh bên. **DeepSeek cần cả Gemini API key để nhận diện lời thoại.**\n2. Tải video, bấm **Nghe & dịch**.\n3. Sửa lời dịch trực tiếp hoặc nhập CSV đã chỉnh.\n4. Chọn giữ/xóa tiếng gốc, chỉnh âm lượng rồi tạo video.")
+        st.markdown("1. Chọn DeepSeek hoặc Gemini và ngôn ngữ ở thanh bên. DeepSeek tự nhận dạng tiếng nói bằng API riêng.\n2. Tải video, bấm **Nghe & dịch**.\n3. Sửa lời dịch trực tiếp hoặc nhập CSV đã chỉnh.\n4. Chọn giữ/xóa tiếng gốc, chỉnh âm lượng rồi tạo video.")
 
     if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
         st.error("Chưa cài FFmpeg (cần cả ffmpeg và ffprobe trong PATH). "
@@ -816,26 +865,21 @@ def main():
     # ---- Thanh bên ----
     with st.sidebar:
         st.header("⚙️ Cài đặt")
-        provider = st.selectbox("Nhà cung cấp dịch", ["Gemini", "DeepSeek", "ChatGPT (chưa kết nối API)"])
-        api_key = st.text_input("Google Gemini API Key:", type="password").strip()
+        provider = st.selectbox("Nhà cung cấp dịch", ["DeepSeek", "Gemini", "ChatGPT (chưa kết nối API)"])
+        api_key, choice, items = "", AUTO_MODEL, []
+        if provider == "Gemini":
+            api_key = st.text_input("Google Gemini API Key:", type="password").strip()
+            if api_key:
+                try:
+                    items = rank_models(fetch_model_names(api_key))
+                except Exception as e:  # noqa: BLE001
+                    st.warning(f"Không tải được model Gemini: {explain_error(e)}")
+            names = display_models(items) or PRESET_MODELS
+            choice = st.selectbox("Model Gemini:", [AUTO_MODEL, *names, MANUAL_MODEL])
+            if choice == MANUAL_MODEL:
+                choice = st.text_input("Tên model:", value=PRESET_MODELS[0]).strip() or AUTO_MODEL
 
-        items, list_error = [], None
-        if api_key:
-            try:
-                items = rank_models(fetch_model_names(api_key))
-            except Exception as e:  # noqa: BLE001
-                list_error = explain_error(e)
-        if list_error:
-            st.warning(f"Không lấy được danh sách model: {list_error}")
-        names = display_models(items) or PRESET_MODELS
-        choice = st.selectbox("Model Gemini:", [AUTO_MODEL, *names, MANUAL_MODEL],
-                              help="Tự động = model Flash ổn định mới nhất trong tài khoản của bạn, "
-                                   "tự chuyển sang model khác nếu gặp lỗi hoặc hết quota. "
-                                   "Muốn chính xác hơn có thể chọn bản Pro.")
-        if choice == MANUAL_MODEL:
-            choice = st.text_input("Tên model:", value=PRESET_MODELS[0]).strip() or AUTO_MODEL
-
-        deepseek_client, deepseek_model = None, None
+        deepseek_client, deepseek_model, deepseek_key = None, None, ""
         if provider == "DeepSeek":
             deepseek_key = st.text_input("DeepSeek API Key:", type="password").strip()
             deepseek_models = []
@@ -850,7 +894,7 @@ def main():
                 selected_ds = st.selectbox("Model DeepSeek:", ["Tự động (model mới nhất từ API)", *deepseek_models])
                 deepseek_model = deepseek_models[0] if selected_ds.startswith("Tự động") else selected_ds
             else:
-                st.caption("Gemini sẽ chép lời có mốc thời gian; cần DeepSeek API Key để dịch.")
+                st.caption("DeepSeek API sẽ nhận diện tiếng nói rồi dịch. Nhập key để tải danh sách model.")
         elif provider.startswith("ChatGPT"):
             st.info("Lựa chọn ChatGPT hiện chỉ là giao diện. Tích hợp OpenAI API chưa được bật.")
 
@@ -907,7 +951,7 @@ def main():
     st.caption("Quy trình hỗ trợ video dài bằng cách chia audio thành các đoạn dịch; giới hạn thực tế còn tùy RAM, ổ đĩa, thời gian chạy và hạn mức API.")
     if provider.startswith("ChatGPT"):
         st.stop()
-    if not api_key:
+    if provider == "Gemini" and not api_key:
         st.warning("⚠️ Vui lòng nhập Google Gemini API Key ở thanh bên trái để bắt đầu.")
         st.stop()
     if provider == "DeepSeek" and (not deepseek_client or not deepseek_model):
@@ -954,9 +998,13 @@ def main():
             progress(0.02, "Đang tách âm thanh từ video...")
             audio_path = os.path.join(workdir, "source_audio.mp3")
             extract_audio(video_path, audio_path)
-            chain = model_chain(choice, items)
-            segs, used = translate_audio(audio_path, total, api_key, chain, src, dst,
-                                         glossary, workdir, progress, deepseek_client, deepseek_model)
+            if provider == "DeepSeek":
+                segs, used = translate_audio_deepseek(
+                    audio_path, total, deepseek_key, deepseek_client, deepseek_model, dst, workdir, progress)
+            else:
+                chain = model_chain(choice, items)
+                segs, used = translate_audio(audio_path, total, api_key, chain, src, dst,
+                                             glossary, workdir, progress)
             st.session_state.segments = segs
             st.session_state.used_models = used
             bar.empty()
