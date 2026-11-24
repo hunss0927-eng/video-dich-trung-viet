@@ -850,10 +850,11 @@ def make_srt(segments):
     return "\n".join(lines)
 
 
-def parse_srt(content, total):
-    """Load existing subtitle cues and preserve their timestamps for direct dubbing."""
+def parse_subtitles(content, total):
+    """Load SRT/WebVTT cues and preserve timestamps for direct dubbing."""
     cues = []
-    pattern = re.compile(r"(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})")
+    timestamp = r"(?:\d{2}:)?\d{2}:\d{2}[,.]\d{3}"
+    pattern = re.compile(rf"({timestamp})\s*-->\s*({timestamp})(?:\s+.*)?$")
     for block in re.split(r"\r?\n\s*\r?\n", content.strip()):
         lines = block.splitlines()
         match = next((pattern.search(line) for line in lines if pattern.search(line)), None)
@@ -866,7 +867,7 @@ def parse_srt(content, total):
             cues.append({"start": match.group(1), "end": match.group(2), "speaker": None, "text": text})
     normalized = normalize_segments(cues, total)
     if not normalized:
-        raise ValueError("Không tìm thấy câu phụ đề SRT hợp lệ trong file.")
+        raise ValueError("Không tìm thấy câu phụ đề SRT/VTT hợp lệ trong file.")
     return normalized
 
 
@@ -993,7 +994,7 @@ def main():
     uploaded = st.file_uploader(f"Tải lên video (tối đa cấu hình {MAX_UPLOAD_MB:,} MB; giới hạn máy chủ có thể thấp hơn)", type=["mp4", "mov", "avi", "mkv"])
     srt_uploaded = None
     if provider == "Lồng tiếng từ SRT (không dịch)":
-        srt_uploaded = st.file_uploader("Tải lên phụ đề .srt để lồng tiếng trực tiếp", type=["srt"], key="direct_srt_upload")
+        srt_uploaded = st.file_uploader("Tải lên phụ đề .srt hoặc .vtt để lồng tiếng trực tiếp", type=["srt", "vtt"], key="direct_srt_upload")
     st.caption("Quy trình hỗ trợ video dài bằng cách chia audio thành các đoạn dịch; giới hạn thực tế còn tùy RAM, ổ đĩa, thời gian chạy và hạn mức API.")
     if provider.startswith("ChatGPT"):
         st.stop()
@@ -1039,8 +1040,8 @@ def main():
             if st.session_state.get("direct_srt_key") != srt_key:
                 try:
                     subtitle_text = srt_uploaded.getvalue().decode("utf-8-sig", errors="replace")
-                    st.session_state.segments = parse_srt(subtitle_text, total)
-                    st.session_state.used_models = ["Phụ đề SRT (không dịch)"]
+                    st.session_state.segments = parse_subtitles(subtitle_text, total)
+                    st.session_state.used_models = [f"Phụ đề {os.path.splitext(srt_uploaded.name)[1][1:].upper()} (không dịch)"]
                     st.session_state.pop("result", None)
                     st.session_state.pop("segment_editor", None)
                     st.session_state.direct_srt_key = srt_key
