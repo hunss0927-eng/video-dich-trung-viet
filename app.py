@@ -890,7 +890,7 @@ def parse_subtitles(content, total, filename=""):
         for i, (start, text) in enumerate(rows):
             end = rows[i + 1][0] if i + 1 < len(rows) else min(start + 4, total)
             cues.append({"start": start, "end": end, "speaker": None, "text": text})
-    else:  # SubRip (.srt) and WebVTT (.vtt)
+    else:  # SubRip, WebVTT, and SRT-style Markdown transcript files
         timestamp = r"(?:\d{2}:)?\d{2}:\d{2}[,.]\d{3}"
         pattern = re.compile(rf"({timestamp})\s*-->\s*({timestamp})(?:\s+.*)?$")
         for block in re.split(r"\r?\n\s*\r?\n", content.strip()):
@@ -901,11 +901,16 @@ def parse_subtitles(content, total, filename=""):
             text_start = lines.index(match.string) + 1 if match.string in lines else 0
             text = " ".join(lines[text_start:]).strip()
             text = re.sub(r"<[^>]+>", "", text).replace(r"\N", " ").strip()
+            if ext == ".md":
+                translated = re.findall(r"\(([^()]+)\)", text)
+                text = " ".join(x.strip() for x in translated if x.strip()) if translated else text
+                if re.fullmatch(r"\[[^\]]+\]", text.strip()):
+                    continue  # skip cues such as [Âm nhạc mở đầu]
             if text:
                 cues.append({"start": match.group(1), "end": match.group(2), "speaker": None, "text": text})
     normalized = normalize_segments(cues, total)
     if not normalized:
-        raise ValueError("Không tìm thấy câu phụ đề hợp lệ. Hỗ trợ SRT, VTT, SBV, ASS/SSA và LRC.")
+        raise ValueError("Không tìm thấy câu phụ đề hợp lệ. Hỗ trợ SRT, VTT, SBV, ASS/SSA, LRC và Markdown dạng SRT.")
     return normalized
 
 
@@ -1032,7 +1037,7 @@ def main():
     uploaded = st.file_uploader(f"Tải lên video (tối đa cấu hình {MAX_UPLOAD_MB:,} MB; giới hạn máy chủ có thể thấp hơn)", type=["mp4", "mov", "avi", "mkv"])
     srt_uploaded = None
     if provider == "Lồng tiếng từ SRT (không dịch)":
-        srt_uploaded = st.file_uploader("Tải lên phụ đề SRT, VTT, SBV, ASS/SSA hoặc LRC", type=["srt", "vtt", "sbv", "ass", "ssa", "lrc"], key="direct_srt_upload")
+        srt_uploaded = st.file_uploader("Tải lên phụ đề SRT, VTT, SBV, ASS/SSA, LRC hoặc Markdown dạng SRT", type=["srt", "vtt", "sbv", "ass", "ssa", "lrc", "md"], key="direct_srt_upload")
     st.caption("Quy trình hỗ trợ video dài bằng cách chia audio thành các đoạn dịch; giới hạn thực tế còn tùy RAM, ổ đĩa, thời gian chạy và hạn mức API.")
     if provider.startswith("ChatGPT"):
         st.stop()
