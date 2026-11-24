@@ -240,6 +240,8 @@ def explain_error(e):
     code = getattr(e, "code", None)
     text = str(e)
     low = text.lower()
+    if code == 402 or ("402" in low and "payment" in low):
+        return "DeepSeek API hết số dư hoặc chưa bật thanh toán. Nạp credit trên DeepSeek Platform rồi thử lại; đây là lỗi thanh toán, không phải lỗi file video."
     if code == 400 and ("api key" in low or "api_key" in low):
         return "API key không hợp lệ. Hãy kiểm tra lại key (lấy tại aistudio.google.com/apikey)."
     if code in (401, 403):
@@ -943,7 +945,7 @@ def main():
         </style>
     """, unsafe_allow_html=True)
     with st.expander("🧭 Hướng dẫn nhanh", expanded=False):
-        st.markdown("1. Chọn DeepSeek hoặc Gemini và ngôn ngữ ở thanh bên. DeepSeek tự nhận dạng tiếng nói bằng API riêng.\n2. Tải video, bấm **Nghe & dịch**.\n3. Sửa lời dịch trực tiếp hoặc nhập CSV đã chỉnh.\n4. Chọn giữ/xóa tiếng gốc, chỉnh âm lượng rồi tạo video.")
+        st.markdown("1. Chọn **DeepSeek · tự dịch video** để nhận dạng và dịch trực tiếp, không cần phụ đề.\n2. Nhập DeepSeek API key còn số dư, tải video và bấm **Nghe & dịch video**.\n3. Sửa lời dịch nếu cần.\n4. Chọn âm thanh nền, giọng đọc rồi tạo video.")
 
     if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
         st.error("Chưa cài FFmpeg (cần cả ffmpeg và ffprobe trong PATH). "
@@ -955,7 +957,9 @@ def main():
     # ---- Thanh bên ----
     with st.sidebar:
         st.header("⚙️ Cài đặt")
-        provider = st.selectbox("Chế độ", ["Lồng tiếng từ SRT (không dịch)", "DeepSeek", "Gemini", "ChatGPT (chưa kết nối API)"])
+        provider = st.selectbox("Chế độ", ["DeepSeek · tự dịch video (không cần phụ đề)", "Gemini", "Lồng tiếng từ phụ đề (không dịch)", "ChatGPT (chưa kết nối API)"])
+        is_deepseek = provider.startswith("DeepSeek")
+        is_subtitle_mode = provider.startswith("Lồng tiếng từ phụ đề")
         api_key, choice, items = "", AUTO_MODEL, []
         if provider == "Gemini":
             api_key = st.text_input("Google Gemini API Key:", type="password").strip()
@@ -970,7 +974,7 @@ def main():
                 choice = st.text_input("Tên model:", value=PRESET_MODELS[0]).strip() or AUTO_MODEL
 
         deepseek_client, deepseek_model, deepseek_key = None, None, ""
-        if provider == "DeepSeek":
+        if is_deepseek:
             deepseek_key = st.text_input("DeepSeek API Key:", type="password").strip()
             deepseek_models = []
             if deepseek_key:
@@ -985,7 +989,7 @@ def main():
                 selected_ds = st.selectbox("Model DeepSeek:", ["Tự động (model mới nhất từ API)", *deepseek_models])
                 deepseek_model = deepseek_models[0] if selected_ds.startswith("Tự động") else selected_ds
             else:
-                st.caption("DeepSeek API sẽ nhận diện tiếng nói rồi dịch. Nhập key để tải danh sách model.")
+                st.caption("Tự nghe và dịch trực tiếp từ video, không cần phụ đề. DeepSeek API cần có số dư để xử lý audio.")
         elif provider.startswith("ChatGPT"):
             st.info("Lựa chọn ChatGPT hiện chỉ là giao diện. Tích hợp OpenAI API chưa được bật.")
 
@@ -1040,7 +1044,7 @@ def main():
 
     uploaded = st.file_uploader(f"Tải lên video (tối đa cấu hình {MAX_UPLOAD_MB:,} MB; giới hạn máy chủ có thể thấp hơn)", type=["mp4", "mov", "avi", "mkv"])
     srt_uploaded = None
-    if provider == "Lồng tiếng từ SRT (không dịch)":
+    if is_subtitle_mode:
         srt_uploaded = st.file_uploader("Tải lên phụ đề SRT, VTT, SBV, ASS/SSA, LRC hoặc Markdown dạng SRT", type=["srt", "vtt", "sbv", "ass", "ssa", "lrc", "md"], key="direct_srt_upload")
     st.caption("Quy trình hỗ trợ video dài bằng cách chia audio thành các đoạn dịch; giới hạn thực tế còn tùy RAM, ổ đĩa, thời gian chạy và hạn mức API.")
     if provider.startswith("ChatGPT"):
@@ -1048,7 +1052,7 @@ def main():
     if provider == "Gemini" and not api_key:
         st.warning("⚠️ Vui lòng nhập Google Gemini API Key ở thanh bên trái để bắt đầu.")
         st.stop()
-    if provider == "DeepSeek" and (not deepseek_client or not deepseek_model):
+    if is_deepseek and (not deepseek_client or not deepseek_model):
         st.warning("Nhập DeepSeek API Key hợp lệ để tiếp tục.")
         st.stop()
     if not uploaded:
@@ -1079,9 +1083,9 @@ def main():
     m2.metric("Dung lượng", f"{uploaded.size / (1024 * 1024):.1f} MB")
     m3.metric("Tiếng gốc", "Giữ làm nền" if keep_original else "Sẽ xóa")
 
-    if provider == "Lồng tiếng từ SRT (không dịch)":
+    if is_subtitle_mode:
         if not srt_uploaded:
-            st.info("Tải file .srt có sẵn để dùng phụ đề làm lời lồng tiếng. Chế độ này không gọi API dịch.")
+            st.info("Tải file phụ đề có sẵn để dùng làm lời lồng tiếng. Chế độ này không gọi API nhận dạng/dịch.")
         else:
             srt_key = (srt_uploaded.name, srt_uploaded.size, video_key)
             if st.session_state.get("direct_srt_key") != srt_key:
@@ -1100,7 +1104,7 @@ def main():
                     st.error(f"Không đọc được phụ đề: {e}")
 
     # ---- Bước 1: nghe & dịch ----
-    if provider != "Lồng tiếng từ SRT (không dịch)" and st.button("1️⃣ Nghe & dịch", type="primary"):
+    if not is_subtitle_mode and st.button("1️⃣ Nghe & dịch video", type="primary"):
         for k in ("result", "segments", "segment_editor"):
             st.session_state.pop(k, None)
         bar = st.progress(0.0, text="Đang bắt đầu...")
@@ -1112,7 +1116,7 @@ def main():
             progress(0.02, "Đang tách âm thanh từ video...")
             audio_path = os.path.join(workdir, "source_audio.mp3")
             extract_audio(video_path, audio_path)
-            if provider == "DeepSeek":
+            if is_deepseek:
                 segs, used = translate_audio_deepseek(
                     audio_path, total, deepseek_key, deepseek_client, deepseek_model, dst, workdir, progress)
             else:
