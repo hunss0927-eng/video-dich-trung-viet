@@ -28,6 +28,7 @@ import pandas as pd
 import streamlit as st
 from google import genai
 from google.genai import types
+from openai import OpenAI
 
 try:  # giọng dự phòng khi Edge-TTS bị chặn / lỗi mạng
     from gtts import gTTS
@@ -118,7 +119,8 @@ GTTS_LANG = {"zh": "zh-CN", "fil": "tl", "he": "iw"}  # còn lại dùng nguyên
 # ---- Model Gemini: không gắn cứng tên (Google đổi model rất nhanh) ----
 AUTO_MODEL = "🤖 Tự động (Flash ổn định mới nhất)"
 MANUAL_MODEL = "✏️ Nhập tên model khác..."
-PRESET_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]
+PRESET_MODELS = ["gemini-flash-latest"]
+MAX_UPLOAD_MB = 10_000
 _MODEL_RE = re.compile(r"^gemini-(\d+(?:\.\d+)?)-(flash-lite|flash|pro)(?:-(.+))?$")
 _MODEL_EXCLUDE = (
     "tts", "image", "live", "embedding", "transcribe", "native-audio", "robotics",
@@ -495,7 +497,7 @@ def parse_segments(raw, total):
     return normalize_segments(data, total)  # có thể rỗng: đoạn không có lời thoại
 
 
-def build_prompt(src_code, dst_code, glossary, previous):
+def build_prompt(src_code, dst_code, glossary, previous, transcribe_only=False):
     if src_code == "auto":
         src_rule = "The spoken language is unknown: detect it automatically (it may be several languages)."
     else:
@@ -507,7 +509,41 @@ def build_prompt(src_code, dst_code, glossary, previous):
     if previous:
         ctx = ("\nFor continuity, the previous part of the video ended with these translated lines "
                "(do NOT repeat them):\n" + "\n".join(f"- {t}" for t in previous) + "\n")
-    return PROMPT.format(src_rule=src_rule, dst=LANGUAGES[dst_code][1], glossary=gl, context=ctx)
+    prompt = PROMPT.format(src_rule=src_rule, dst=LANGUAGES[dst_code][1], glossary=gl, context=ctx)
+    if transcribe_only:
+        prompt = prompt.replace(
+            f"Translate ALL speech into natural spoken {LANGUAGES[dst_code][1]}.",
+            "Transcribe ALL speech verbatim in its original language; do not translate. Preserve names and wording.",
+        )
+        prompt = prompt.replace(
+            "Translate meaning, tone and register naturally, not word by word. Keep proper names consistent.",
+            "Write the original spoken words verbatim and keep names consistent.",
+        ).replace(
+            f"The translation will be spoken aloud in the same time slot, so keep it concise: the {LANGUAGES[dst_code][1]} text should take about\n   as long to say as the original speech.",
+            "Keep the transcript aligned to the original speech timing.",
+        )
+    return prompt
+
+
+def translate_with_deepseek(client, model, segments, dst_code):
+    """Translate timestamped source transcript while preserving timing and speaker."""
+    if not segments:
+        return segments
+    payload = [{"i": i, "text": s["text"]} for i, s in enumerate(segments)]
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": f"Translate each text naturally into {LANGUAGES[dst_code][1]}. Return only a JSON object with one key 'translations', whose value is an array of objects with i and text. Preserve every item and index."},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        response_format={"type": "json_object"},
+    )
+    body = json.loads(response.choices[0].message.content)
+    rows = body if isinstance(body, list) else body.get("translations", body.get("segments", []))
+    by_index = {int(row["i"]): row["text"] for row in rows if isinstance(row, dict) and "i" in row and isinstance(row.get("text"), str)}
+    if len(by_index) != len(segments):
+        raise ValueError("DeepSeek không trả đủ các câu dịch; hãy thử lại.")
+    return [{**seg, "text": by_index[i]} for i, seg in enumerate(segments)]
 
 
 def _file_state(f):
@@ -528,12 +564,14 @@ def upload_and_wait(client, path):
     else:
         raise err
     waited = 0
-    while _file_state(f) == "PROCESSING" and waited < 180:  # chờ file ACTIVE mới dùng được
+    while _file_state(f) == "PROCESSING" and waited < 900:  # file dài cần thời gian xử lý lâu hơn
         time.sleep(2)
         waited += 2
         f = client.files.get(name=f.name)
     if _file_state(f) == "FAILED":
         raise RuntimeError("Gemini không xử lý được file âm thanh.")
+    if _file_state(f) == "PROCESSING":
+        raise TimeoutError("Gemini vẫn đang xử lý file sau 15 phút. Hãy thử lại hoặc chia video ngắn hơn.")
     return f
 
 
@@ -591,7 +629,8 @@ def translate_chunk(client, uploaded, chain, prompt, chunk_dur):
     raise last_err
 
 
-def translate_audio(audio_path, total, api_key, chain, src, dst, glossary, workdir, progress):
+def translate_audio(audio_path, total, api_key, chain, src, dst, glossary, workdir, progress,
+                    deepseek_client=None, deepseek_model=None):
     client = genai.Client(api_key=api_key)
     mids = silence_midpoints(audio_path) if total > CHUNK_SECONDS * 1.4 else []
     chunks = plan_chunks(total, mids)
@@ -605,7 +644,7 @@ def translate_audio(audio_path, total, api_key, chain, src, dst, glossary, workd
             cut_audio(audio_path, cs, ce - cs, part)
         uploaded = upload_and_wait(client, part)
         try:
-            prompt = build_prompt(src, dst, glossary, previous)
+            prompt = build_prompt(src, dst, glossary, previous, transcribe_only=deepseek_client is not None)
             segs, model = translate_chunk(client, uploaded, chain, prompt, ce - cs)
         finally:
             try:  # luôn xóa file trên server Gemini
@@ -620,6 +659,9 @@ def translate_audio(audio_path, total, api_key, chain, src, dst, glossary, workd
             s["end"] = round(s["end"] + cs, 2)
         all_segs += segs
         previous = [s["text"] for s in segs[-4:]]
+    if deepseek_client is not None:
+        progress(0.94, "DeepSeek đang dịch bản chép lời và giữ nguyên mốc thời gian...")
+        all_segs = translate_with_deepseek(deepseek_client, deepseek_model, all_segs, dst)
     if not all_segs:
         raise ValueError("Không nhận diện được lời thoại nào trong video "
                          "(video có thể không có lời nói, hoặc chọn sai ngôn ngữ gốc).")
@@ -637,8 +679,18 @@ def build_dub_track(segments, seg_paths, total, max_speed, out_wav):
     Đoạn đọc dài hơn khoảng trống cho phép sẽ được tăng tốc (tối đa max_speed);
     nếu vẫn dài thì đẩy lùi đoạn kế tiếp một chút để không chồng tiếng.
     """
+    # Ghi WAV theo từng block để video nhiều giờ không cần giữ toàn bộ track trong RAM.
     total_samples = int(total * SAMPLE_RATE)
-    track = np.zeros(total_samples, dtype=np.int32)
+    block_samples = SAMPLE_RATE * 10
+    dtype = np.int16
+    track_file = out_wav + ".pcm"
+    with open(track_file, "wb") as f:
+        zero_block = np.zeros(block_samples, dtype=dtype)
+        left = total_samples
+        while left:
+            n = min(left, block_samples)
+            f.write(zero_block[:n].tobytes())
+            left -= n
     gap = int(0.08 * SAMPLE_RATE)
     cursor, sped_up, max_delay = 0, 0, 0.0
 
@@ -660,26 +712,43 @@ def build_dub_track(segments, seg_paths, total, max_speed, out_wav):
                 sped_up += 1
         end = min(start + len(pcm), total_samples)
         if end > start:
-            track[start:end] += pcm[: end - start]
+            # Mix in small blocks and saturate each write; avoids huge int32 allocations.
+            with open(track_file, "r+b") as f:
+                pos = start
+                offset = 0
+                while pos < end:
+                    n = min(block_samples, end - pos)
+                    f.seek(pos * 2)
+                    base = np.frombuffer(f.read(n * 2), dtype=np.int16).astype(np.int32)
+                    mixed = np.clip(base + pcm[offset:offset + n].astype(np.int32), -32768, 32767).astype(np.int16)
+                    f.seek(pos * 2)
+                    f.write(mixed.tobytes())
+                    pos += n
+                    offset += n
         cursor = end + gap
         max_delay = max(max_delay, (start - wanted) / SAMPLE_RATE)
 
-    track = np.clip(track, -32768, 32767).astype(np.int16)
     with wave.open(out_wav, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(SAMPLE_RATE)
-        w.writeframes(track.tobytes())
+        with open(track_file, "rb") as pcm_file:
+            while True:
+                block = pcm_file.read(block_samples * 2)
+                if not block:
+                    break
+                w.writeframesraw(block)
+    os.remove(track_file)
     return {"sped_up": sped_up, "max_delay": max_delay}
 
 
-def merge_audio_video(video_path, dub_wav, out_path, bg_volume=0.0):
+def merge_audio_video(video_path, dub_wav, out_path, bg_volume=0.0, keep_original=True):
     """Ghép giọng lồng tiếng vào video. bg_volume > 0 giữ lại tiếng gốc ở mức nhỏ."""
     cmd = ["ffmpeg", "-y", "-i", video_path, "-i", dub_wav]
-    if bg_volume > 0 and has_audio_stream(video_path):
+    if keep_original and has_audio_stream(video_path):
         fmt = "aformat=sample_rates=44100:channel_layouts=stereo"
         graph = (f"[0:a]volume={bg_volume:.2f},{fmt}[bg];[1:a]{fmt}[vo];"
-                 "[vo][bg]amix=inputs=2:duration=first:dropout_transition=0,volume=2[a]")
+                 "[vo][bg]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]")
         cmd += ["-filter_complex", graph, "-map", "0:v:0", "-map", "[a]"]
     else:
         cmd += ["-map", "0:v:0", "-map", "1:a:0"]
@@ -737,6 +806,7 @@ def main():
     # ---- Thanh bên ----
     with st.sidebar:
         st.header("⚙️ Cài đặt")
+        provider = st.selectbox("Nhà cung cấp dịch", ["Gemini", "DeepSeek", "ChatGPT (chưa kết nối API)"])
         api_key = st.text_input("Google Gemini API Key:", type="password").strip()
 
         items, list_error = [], None
@@ -754,6 +824,25 @@ def main():
                                    "Muốn chính xác hơn có thể chọn bản Pro.")
         if choice == MANUAL_MODEL:
             choice = st.text_input("Tên model:", value=PRESET_MODELS[0]).strip() or AUTO_MODEL
+
+        deepseek_client, deepseek_model = None, None
+        if provider == "DeepSeek":
+            deepseek_key = st.text_input("DeepSeek API Key:", type="password").strip()
+            deepseek_models = []
+            if deepseek_key:
+                try:
+                    deepseek_client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com")
+                    deepseek_models = [m.id for m in deepseek_client.models.list().data]
+                except Exception as e:  # noqa: BLE001
+                    deepseek_client = None
+                    st.warning(f"Không tải được model DeepSeek: {explain_error(e)}")
+            if deepseek_models:
+                selected_ds = st.selectbox("Model DeepSeek:", ["Tự động (model mới nhất từ API)", *deepseek_models])
+                deepseek_model = deepseek_models[0] if selected_ds.startswith("Tự động") else selected_ds
+            else:
+                st.caption("Gemini sẽ chép lời có mốc thời gian; cần DeepSeek API Key để dịch.")
+        elif provider.startswith("ChatGPT"):
+            st.info("Lựa chọn ChatGPT hiện chỉ là giao diện. Tích hợp OpenAI API chưa được bật.")
 
         st.subheader("🌐 Ngôn ngữ")
         src = st.selectbox("Ngôn ngữ trong video:", ["auto", *LANGUAGES],
@@ -784,8 +873,10 @@ def main():
         pitch_hz = st.slider("Cao độ giọng (Hz)", -30, 30, 0, step=5)
         max_speed = st.slider("Tăng tốc tối đa để khớp thời lượng", 1.0, 1.8, 1.4, step=0.1,
                               help="Nếu bản dịch đọc dài hơn lời thoại gốc, giọng đọc sẽ tăng tốc tới mức này.")
-        bg_pct = st.slider("Giữ tiếng gốc làm nền (%)", 0, 30, 0, step=5,
-                           help="0 = thay hoàn toàn âm thanh gốc. Video có nhạc nền có thể để 10-20%.")
+        keep_original = st.checkbox("Giữ âm thanh/nhạc gốc", value=True)
+        bg_pct = st.slider("Âm lượng tiếng gốc (%)", 0, 100, 15, step=5,
+                           disabled=not keep_original,
+                           help="Tắt lựa chọn trên để xóa toàn bộ tiếng gốc khỏi video.")
 
         if st.button("🔊 Nghe thử giọng này"):
             try:
@@ -801,9 +892,15 @@ def main():
                                 placeholder="张伟 = Trương Vĩ\nOne Piece = Đảo Hải Tặc",
                                 help="Mỗi dòng một cặp 'gốc = bản dịch' để tên riêng được dịch nhất quán.")
 
-    uploaded = st.file_uploader("Tải lên video cần dịch (MP4, MOV, AVI, MKV)", type=["mp4", "mov", "avi", "mkv"])
+    uploaded = st.file_uploader(f"Tải lên video (tối đa cấu hình {MAX_UPLOAD_MB:,} MB; giới hạn máy chủ có thể thấp hơn)", type=["mp4", "mov", "avi", "mkv"])
+    st.caption("Quy trình hỗ trợ video dài bằng cách chia audio thành các đoạn dịch; giới hạn thực tế còn tùy RAM, ổ đĩa, thời gian chạy và hạn mức API.")
+    if provider.startswith("ChatGPT"):
+        st.stop()
     if not api_key:
         st.warning("⚠️ Vui lòng nhập Google Gemini API Key ở thanh bên trái để bắt đầu.")
+        st.stop()
+    if provider == "DeepSeek" and (not deepseek_client or not deepseek_model):
+        st.warning("Nhập DeepSeek API Key hợp lệ để tiếp tục.")
         st.stop()
     if not uploaded:
         st.stop()
@@ -842,7 +939,7 @@ def main():
             extract_audio(video_path, audio_path)
             chain = model_chain(choice, items)
             segs, used = translate_audio(audio_path, total, api_key, chain, src, dst,
-                                         glossary, workdir, progress)
+                                         glossary, workdir, progress, deepseek_client, deepseek_model)
             st.session_state.segments = segs
             st.session_state.used_models = used
             bar.empty()
@@ -896,7 +993,7 @@ def main():
 
                     bar.progress(0.8, text="Đang ghép âm thanh lồng tiếng vào video...")
                     out_path = os.path.join(workdir, "output_video.mp4")
-                    merge_audio_video(video_path, dub_wav, out_path, bg_pct / 100)
+                    merge_audio_video(video_path, dub_wav, out_path, bg_pct / 100, keep_original)
 
                     st.session_state.result = {"path": out_path, "srt": make_srt(segments), "stats": stats}
                     bar.empty()
@@ -930,3 +1027,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
