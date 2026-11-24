@@ -5,3 +5,4 @@ numpy
 pandas
 gTTS
 openai>=1.50.0
+requests>=2.31.0
