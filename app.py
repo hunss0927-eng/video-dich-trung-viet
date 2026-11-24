@@ -41,7 +41,8 @@ except Exception:  # noqa: BLE001
 # ----------------------------------------------------------------------------
 SAMPLE_RATE = 24000      # Edge-TTS xuất mp3 24 kHz mono
 CHUNK_SECONDS = 360      # video dài được cắt thành các phần ~6 phút để dịch chính xác hơn
-SESSION_KEYS = ("segments", "result", "video_path", "total", "used_models", "segment_editor")
+SESSION_KEYS = ("segments", "result", "video_path", "total", "used_models", "segment_editor",
+                "direct_srt_key", "imported_csv_key", "subtitle_dropped_count")
 
 # code -> (tên tiếng Việt, tên tiếng Anh dùng trong prompt)
 LANGUAGES = {
@@ -891,7 +892,8 @@ def parse_subtitles(content, total, filename=""):
             end = rows[i + 1][0] if i + 1 < len(rows) else min(start + 4, total)
             cues.append({"start": start, "end": end, "speaker": None, "text": text})
     else:  # SubRip, WebVTT, and SRT-style Markdown transcript files
-        timestamp = r"(?:\d{2}:)?\d{2}:\d{2}[,.]\d{3}"
+        # Accept both WebVTT mm:ss.mmm and hh:mm:ss.mmm time forms.
+        timestamp = r"(?:\d{2}:)?\d{1,2}:\d{2}[,.]\d{3}"
         pattern = re.compile(rf"({timestamp})\s*-->\s*({timestamp})(?:\s+.*)?$")
         for block in re.split(r"\r?\n\s*\r?\n", content.strip()):
             lines = block.splitlines()
@@ -911,7 +913,7 @@ def parse_subtitles(content, total, filename=""):
     normalized = normalize_segments(cues, total)
     if not normalized:
         raise ValueError("Không tìm thấy câu phụ đề hợp lệ. Hỗ trợ SRT, VTT, SBV, ASS/SSA, LRC và Markdown dạng SRT.")
-    return normalized
+    return normalized, max(0, len(cues) - len(normalized))
 
 
 # ----------------------------------------------------------------------------
@@ -933,9 +935,11 @@ def main():
     st.caption("Tải video · Dịch lời thoại · Chỉnh bản dịch · Tạo giọng và xuất video")
     st.markdown("""
         <style>
-        .block-container {max-width: 1450px; padding-top: 1.5rem; padding-bottom: 3rem;}
-        [data-testid="stSidebar"] {min-width: 330px;}
-        div[data-testid="stMetric"] {background: rgba(120,120,120,.08); padding: 12px; border-radius: 12px;}
+        .block-container {max-width: 1480px; padding-top: 1.7rem; padding-bottom: 3rem;}
+        [data-testid="stSidebar"] {min-width: 340px;}
+        div[data-testid="stMetric"] {background: linear-gradient(135deg, rgba(69,123,157,.12), rgba(42,157,143,.09)); padding: 14px; border: 1px solid rgba(69,123,157,.14); border-radius: 14px;}
+        div.stButton > button[kind="primary"] {border-radius: 10px; min-height: 2.8rem; font-weight: 650;}
+        div[data-testid="stFileUploader"] {border-radius: 12px;}
         </style>
     """, unsafe_allow_html=True)
     with st.expander("🧭 Hướng dẫn nhanh", expanded=False):
@@ -1083,11 +1087,15 @@ def main():
             if st.session_state.get("direct_srt_key") != srt_key:
                 try:
                     subtitle_text = srt_uploaded.getvalue().decode("utf-8-sig", errors="replace")
-                    st.session_state.segments = parse_subtitles(subtitle_text, total, srt_uploaded.name)
+                    parsed, dropped = parse_subtitles(subtitle_text, total, srt_uploaded.name)
+                    st.session_state.segments = parsed
+                    st.session_state.subtitle_dropped_count = dropped
                     st.session_state.used_models = [f"Phụ đề {os.path.splitext(srt_uploaded.name)[1][1:].upper()} (không dịch)"]
                     st.session_state.pop("result", None)
                     st.session_state.pop("segment_editor", None)
                     st.session_state.direct_srt_key = srt_key
+                    if dropped:
+                        st.warning(f"Đã bỏ {dropped} cue có timestamp ngoài thời lượng video. Kiểm tra xem bạn tải đúng video/phụ đề chưa.")
                 except Exception as e:  # noqa: BLE001
                     st.error(f"Không đọc được phụ đề: {e}")
 
@@ -1122,8 +1130,15 @@ def main():
     if st.session_state.get("segments"):
         st.markdown("### 📝 Bước 2 · Kiểm tra và chỉnh lời dịch")
         used = ", ".join(st.session_state.get("used_models", []))
-        st.success(f"Đã dịch {len(st.session_state.segments)} đoạn thoại bằng {used}. "
-                   "Kiểm tra và sửa bản dịch bên dưới (bấm vào ô để sửa, thêm/xóa dòng nếu cần).")
+        segment_count = len(st.session_state.segments)
+        models_used = st.session_state.get("used_models", [])
+        is_subtitle_source = bool(models_used and models_used[0].startswith("Phụ đề"))
+        if segment_count == 1:
+            st.warning("Chỉ tìm thấy 1 câu hợp lệ. Kiểm tra file phụ đề, timestamp và thời lượng video trước khi lồng tiếng.")
+        elif is_subtitle_source:
+            st.success(f"Đã nạp {segment_count} cue từ {used}. Bạn có thể chỉnh trực tiếp bên dưới.")
+        else:
+            st.success(f"Đã tạo {segment_count} đoạn lời thoại bằng {used}. Kiểm tra và chỉnh bản dịch bên dưới.")
         csv_upload = st.file_uploader("Nhập bản dịch đã chỉnh (CSV: start,end,speaker,text)",
                                       type=["csv"], key="translation_csv_upload")
         if csv_upload:
