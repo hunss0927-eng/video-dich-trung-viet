@@ -371,7 +371,8 @@ async def _tts_one(text, voice, rate, pitch, path, sem, gtts_lang, stats, on_don
         try:
             for attempt in range(3):
                 try:
-                    await edge_tts.Communicate(text, voice, rate=rate, pitch=pitch).save(path)
+                    await asyncio.wait_for(
+                        edge_tts.Communicate(text, voice, rate=rate, pitch=pitch).save(path), timeout=90)
                     if os.path.getsize(path) > 0:
                         return True
                     raise RuntimeError("File âm thanh rỗng")
@@ -550,7 +551,7 @@ def translate_with_deepseek(client, model, segments, dst_code):
 def translate_audio_deepseek(audio_path, total, api_key, client, model, dst_code, workdir, progress):
     """Use DeepSeek ASR directly, then translate transcript; ASR has no word timestamps."""
     sentences = []
-    chunk_seconds = 115  # DeepSeek ASR limit is 120 seconds per request.
+    chunk_seconds = 45  # Small calls return progress more often; DeepSeek accepts at most 120 sec.
     chunk_count = max(1, math.ceil(total / chunk_seconds))
     for i in range(chunk_count):
         start = i * chunk_seconds
@@ -562,14 +563,29 @@ def translate_audio_deepseek(audio_path, total, api_key, client, model, dst_code
                      "-i", audio_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path])
             if os.path.getsize(wav_path) > 8 * 1024 * 1024:
                 raise ValueError("Đoạn audio DeepSeek vượt 8 MB; hãy giảm thời lượng từng đoạn.")
-            with open(wav_path, "rb") as f:
-                response = requests.post(
-                    "https://api.deepseek.com/v1/tools/asr",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    files={"file": (os.path.basename(wav_path), f, "audio/wav")},
-                    timeout=600,
-                )
-            response.raise_for_status()
+            response = None
+            for attempt in range(3):
+                try:
+                    with open(wav_path, "rb") as f:
+                        response = requests.post(
+                            "https://api.deepseek.com/v1/tools/asr",
+                            headers={"Authorization": f"Bearer {api_key}"},
+                            files={"file": (os.path.basename(wav_path), f, "audio/wav")},
+                            timeout=(15, 120),
+                        )
+                    if response.status_code in (408, 429, 500, 502, 503, 504) and attempt < 2:
+                        progress(0.08 + 0.65 * i / chunk_count,
+                                 f"DeepSeek đang bận; thử lại đoạn {i + 1} ({attempt + 2}/3)...")
+                        time.sleep(2 ** attempt)
+                        continue
+                    response.raise_for_status()
+                    break
+                except (requests.Timeout, requests.ConnectionError) as e:
+                    if attempt == 2:
+                        raise TimeoutError(f"DeepSeek không phản hồi sau 3 lần thử ở đoạn {i + 1}: {e}") from e
+                    progress(0.08 + 0.65 * i / chunk_count,
+                             f"Mạng chậm; thử lại đoạn {i + 1} ({attempt + 2}/3)...")
+                    time.sleep(2 ** attempt)
             transcript = response.json().get("text", "").strip()
         finally:
             if os.path.exists(wav_path):
@@ -589,8 +605,14 @@ def translate_audio_deepseek(audio_path, total, api_key, client, model, dst_code
             offset += span
     if not sentences:
         raise ValueError("DeepSeek không nhận diện được lời thoại trong video.")
-    progress(0.78, "DeepSeek đang dịch lời thoại...")
-    translated = translate_with_deepseek(client, model, sentences, dst_code)
+    translated = []
+    batch_size = 10
+    batch_count = math.ceil(len(sentences) / batch_size)
+    for i in range(batch_count):
+        batch = sentences[i * batch_size:(i + 1) * batch_size]
+        progress(0.75 + 0.23 * i / batch_count,
+                 f"DeepSeek đang dịch nhóm {i + 1}/{batch_count} ({len(sentences)} câu)...")
+        translated.extend(translate_with_deepseek(client, model, batch, dst_code))
     progress(1.0, "Đã chép lời và dịch xong bằng DeepSeek")
     return translated, [f"DeepSeek ASR + {model}"]
 
@@ -885,7 +907,8 @@ def main():
             deepseek_models = []
             if deepseek_key:
                 try:
-                    deepseek_client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com")
+                    deepseek_client = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com",
+                                             timeout=60.0, max_retries=0)
                     deepseek_models = [m.id for m in deepseek_client.models.list().data]
                 except Exception as e:  # noqa: BLE001
                     deepseek_client = None
